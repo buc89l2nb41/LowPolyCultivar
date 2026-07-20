@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/
+output/
+test-duck.glb
+*.log
+.DS_Store
+.env
+.env.*
+.cursor/
+*.onnx

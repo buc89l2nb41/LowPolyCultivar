@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Sprite Compare</title>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.185.1/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.1/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <script type="module">
+      import * as THREE from "three";
+      import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+      import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
+      import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
+      import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+
+      const CELL_SIZE = 256;
+      const CAPTURE_ANGLES = [0, 90, 180, 270];
+      const BG = { r: 26, g: 34, b: 48 };
+      const BG_TOLERANCE = 14;
+      const TARGET_SIZE = 1.5;
+      const KTX2_BASIS_PATH =
+        "https://cdn.jsdelivr.net/gh/pmndrs/drei-assets@master/basis/";
+
+      let renderer = null;
+      let loader = null;
+      let ktx2Loader = null;
+
+      function getRenderer() {
+        if (!renderer) {
+          renderer = new THREE.WebGLRenderer({
+            antialias: true,
+            alpha: true,
+            preserveDrawingBuffer: true,
+          });
+          renderer.setSize(CELL_SIZE, CELL_SIZE, false);
+          renderer.setClearColor(0x1a2230, 1);
+          renderer.outputColorSpace = THREE.SRGBColorSpace;
+          renderer.toneMapping = THREE.ACESFilmicToneMapping;
+          renderer.toneMappingExposure = 1.28;
+        }
+        return renderer;
+      }
+
+      async function getLoader() {
+        if (!loader) {
+          await MeshoptDecoder.ready;
+          loader = new GLTFLoader();
+          loader.setMeshoptDecoder(MeshoptDecoder);
+        }
+        if (!ktx2Loader) {
+          ktx2Loader = new KTX2Loader();
+          ktx2Loader.setTranscoderPath(KTX2_BASIS_PATH);
+        }
+        const gl = getRenderer();
+        ktx2Loader.detectSupport(gl);
+        loader.setKTX2Loader(ktx2Loader);
+        return loader;
+      }
+
+      function prepareDisplayMaterials(root) {
+        root.traverse((child) => {
+          if (!(child instanceof THREE.Mesh)) return;
+          const materials = Array.isArray(child.material)
+            ? child.material
+            : [child.material];
+          for (const material of materials) {
+            if (
+              material instanceof THREE.MeshStandardMaterial ||
+              material instanceof THREE.MeshPhysicalMaterial
+            ) {
+              material.emissive.setHex(0x000000);
+              material.emissiveIntensity = 0;
+              material.envMapIntensity = 1.4;
+              material.needsUpdate = true;
+            }
+          }
+        });
+      }
+
+      function normalizeModelRoot(scene) {
+        const clone = scene.clone(true);
+        const box = new THREE.Box3().setFromObject(clone);
+        const size = box.getSize(new THREE.Vector3());
+        const max = Math.max(size.x, size.y, size.z, 0.001);
+        clone.scale.setScalar(TARGET_SIZE / max);
+        const box2 = new THREE.Box3().setFromObject(clone);
+        const center = box2.getCenter(new THREE.Vector3());
+        clone.position.sub(center);
+        const root = new THREE.Group();
+        root.add(clone);
+        prepareDisplayMaterials(root);
+        return root;
+      }
+
+      function disposeObject3D(root) {
+        root.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            child.geometry?.dispose();
+            const mat = child.material;
+            if (Array.isArray(mat)) {
+              for (const m of mat) m.dispose();
+            } else {
+              mat?.dispose();
+            }
+          }
+        });
+      }
+
+      let studioEnvironment = null;
+      let pmremGenerator = null;
+
+      function applyStudioEnvironment(scene) {
+        const gl = getRenderer();
+        if (!studioEnvironment) {
+          pmremGenerator = new THREE.PMREMGenerator(gl);
+          pmremGenerator.compileEquirectangularShader();
+          const room = new RoomEnvironment();
+          studioEnvironment = pmremGenerator.fromScene(room, 0.04).texture;
+        }
+        scene.environment = studioEnvironment;
+      }
+
+      function saveCameraFrame(camera) {
+        return {
+          position: camera.position.toArray(),
+          quaternion: camera.quaternion.toArray(),
+          near: camera.near,
+          far: camera.far,
+          fov: camera.fov,
+        };
+      }
+
+      function applyCameraFrame(camera, frame) {
+        camera.position.fromArray(frame.position);
+        camera.quaternion.fromArray(frame.quaternion);
+        camera.near = frame.near;
+        camera.far = frame.far;
+        camera.fov = frame.fov;
+        camera.updateProjectionMatrix();
+      }
+
+      function fitCameraToModel(camera, model) {
+        model.updateMatrixWorld(true);
+        const box = new THREE.Box3().setFromObject(model);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z, 0.001);
+        const vFov = THREE.MathUtils.degToRad(camera.fov);
+        const dist = (maxDim / 2 / Math.tan(vFov / 2)) * 1.28;
+        camera.position.set(
+          center.x + dist * 0.42,
+          center.y + dist * 0.34,
+          center.z + dist,
+        );
+        camera.lookAt(center);
+        camera.near = dist / 100;
+        camera.far = dist * 20;
+        camera.updateProjectionMatrix();
+      }
+
+      function loadImage(src) {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error("Failed to load capture image"));
+          img.src = src;
+        });
+      }
+
+      async function readRenderImageData(gl) {
+        const dataUrl = gl.domElement.toDataURL("image/png");
+        const img = await loadImage(dataUrl);
+        const canvas = document.createElement("canvas");
+        canvas.width = CELL_SIZE;
+        canvas.height = CELL_SIZE;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        return ctx.getImageData(0, 0, CELL_SIZE, CELL_SIZE);
+      }
+
+      async function captureViews(url, referenceFrames) {
+        const gltfLoader = await getLoader();
+        const gltf = await gltfLoader.loadAsync(url);
+        const model = normalizeModelRoot(gltf.scene);
+        const scene = new THREE.Scene();
+        scene.add(model);
+        applyStudioEnvironment(scene);
+        scene.add(new THREE.AmbientLight(0xffffff, 0.38));
+
+        const gl = getRenderer();
+        const camera = new THREE.PerspectiveCamera(42, 1, 0.01, 1000);
+        const images = [];
+        const frames = [];
+
+        try {
+          for (let index = 0; index < CAPTURE_ANGLES.length; index++) {
+            const yawDeg = CAPTURE_ANGLES[index];
+            model.rotation.set(0, THREE.MathUtils.degToRad(yawDeg), 0);
+            if (referenceFrames) {
+              applyCameraFrame(camera, referenceFrames[index]);
+            } else {
+              fitCameraToModel(camera, model);
+              frames.push(saveCameraFrame(camera));
+            }
+            gl.render(scene, camera);
+            images.push(await readRenderImageData(gl));
+          }
+        } finally {
+          scene.remove(model);
+          disposeObject3D(model);
+        }
+
+        return { images, frames };
+      }
+
+      function isBackgroundPixel(r, g, b) {
+        return (
+          Math.abs(r - BG.r) <= BG_TOLERANCE &&
+          Math.abs(g - BG.g) <= BG_TOLERANCE &&
+          Math.abs(b - BG.b) <= BG_TOLERANCE
+        );
+      }
+
+      function findForegroundCrop(data, width, height, marginRatio = 0.06) {
+        let minX = width;
+        let minY = height;
+        let maxX = 0;
+        let maxY = 0;
+        let found = false;
+
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const index = (y * width + x) * 4;
+            if (isBackgroundPixel(data[index], data[index + 1], data[index + 2])) {
+              continue;
+            }
+            found = true;
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+          }
+        }
+
+        if (!found) {
+          return { x: 0, y: 0, width, height };
+        }
+
+        const fgW = maxX - minX + 1;
+        const fgH = maxY - minY + 1;
+        const side = Math.max(fgW, fgH);
+        const margin = Math.round(side * marginRatio);
+        const cx = (minX + maxX) / 2;
+        const cy = (minY + maxY) / 2;
+        let x = Math.round(cx - side / 2) - margin;
+        let y = Math.round(cy - side / 2) - margin;
+        let cropSide = side + margin * 2;
+        x = Math.max(0, x);
+        y = Math.max(0, y);
+        if (x + cropSide > width) cropSide = width - x;
+        if (y + cropSide > height) cropSide = height - y;
+        return { x, y, width: cropSide, height: cropSide };
+      }
+
+      function cropToBuffer(imageData, crop, size) {
+        const canvas = document.createElement("canvas");
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext("2d");
+        const temp = document.createElement("canvas");
+        temp.width = imageData.width;
+        temp.height = imageData.height;
+        temp.getContext("2d").putImageData(imageData, 0, 0);
+        ctx.drawImage(
+          temp,
+          crop.x,
+          crop.y,
+          crop.width,
+          crop.height,
+          0,
+          0,
+          size,
+          size,
+        );
+        return ctx.getImageData(0, 0, size, size);
+      }
+
+      function meanAbsDiff(refImage, cmpImage) {
+        const crop = findForegroundCrop(
+          refImage.data,
+          refImage.width,
+          refImage.height,
+        );
+        const ref = cropToBuffer(refImage, crop, CELL_SIZE);
+        const cmp = cropToBuffer(cmpImage, crop, CELL_SIZE);
+        let sum = 0;
+        let count = 0;
+        for (let i = 0; i < ref.data.length; i += 4) {
+          if (isBackgroundPixel(ref.data[i], ref.data[i + 1], ref.data[i + 2])) {
+            continue;
+          }
+          sum +=
+            (Math.abs(ref.data[i] - cmp.data[i]) +
+              Math.abs(ref.data[i + 1] - cmp.data[i + 1]) +
+              Math.abs(ref.data[i + 2] - cmp.data[i + 2])) /
+            3;
+          count += 1;
+        }
+        if (count === 0) return 1;
+        return sum / count / 255;
+      }
+
+      async function comparePair(rootUrl, candidateUrl) {
+        const ref = await captureViews(rootUrl);
+        const cmp = await captureViews(candidateUrl, ref.frames);
+        const perAngle = ref.images.map((refImage, index) =>
+          meanAbsDiff(refImage, cmp.images[index]),
+        );
+        const maxDiff = Math.max(...perAngle);
+        const meanDiff = perAngle.reduce((a, b) => a + b, 0) / perAngle.length;
+        return { perAngle, maxDiff, meanDiff };
+      }
+
+      async function compareBatch(rootUrl, items) {
+        const ref = await captureViews(rootUrl);
+        const results = [];
+        for (const item of items) {
+          const cmp = await captureViews(item.url, ref.frames);
+          const perAngle = ref.images.map((refImage, index) =>
+            meanAbsDiff(refImage, cmp.images[index]),
+          );
+          const maxDiff = Math.max(...perAngle);
+          const meanDiff =
+            perAngle.reduce((a, b) => a + b, 0) / perAngle.length;
+          results.push({
+            id: item.id,
+            perAngle,
+            maxDiff,
+            meanDiff,
+          });
+        }
+        results.sort((a, b) => a.maxDiff - b.maxDiff || a.meanDiff - b.meanDiff);
+        return {
+          cellSize: CELL_SIZE,
+          angleCount: CAPTURE_ANGLES.length,
+          entries: results,
+        };
+      }
+
+      window.__spriteComparePair = comparePair;
+      window.__spriteCompareBatch = compareBatch;
+      window.__spriteReady = true;
+    </script>
+  </body>
+</html>
