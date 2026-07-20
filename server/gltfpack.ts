@@ -1,9 +1,36 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile, stat, unlink } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { MeshStats } from "./types.js";
 
-const GLTFPACK_PATH = process.env.GLTFPACK_PATH ?? "d:\\gltfpack\\gltfpack.exe";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function resolveGltfpackPath(): string {
+  const fromEnv = process.env.GLTFPACK_PATH?.trim();
+  if (fromEnv) return path.normalize(fromEnv);
+
+  const exeName = process.platform === "win32" ? "gltfpack.exe" : "gltfpack";
+  const candidates = [
+    path.join(process.cwd(), "tools", "gltfpack", exeName),
+    path.resolve(__dirname, "..", "tools", "gltfpack", exeName),
+    path.resolve(__dirname, "..", "..", "tools", "gltfpack", exeName),
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return path.normalize(candidate);
+  }
+
+  if (
+    process.platform === "win32" &&
+    existsSync("d:\\gltfpack\\gltfpack.exe")
+  ) {
+    return "d:\\gltfpack\\gltfpack.exe";
+  }
+
+  return exeName;
+}
 
 interface GltfpackReport {
   scene: {
@@ -41,7 +68,7 @@ export async function runGltfpack(
   if (reportPath) args.push("-r", reportPath);
 
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(GLTFPACK_PATH, args, { windowsHide: true });
+    const child = spawn(resolveGltfpackPath(), args, { windowsHide: true });
     let stderr = "";
 
     child.stderr.on("data", (chunk: Buffer) => {
@@ -142,5 +169,5 @@ export function formatBytes(bytes: number): string {
 }
 
 export function getGltfpackPath(): string {
-  return path.normalize(GLTFPACK_PATH);
+  return resolveGltfpackPath();
 }
